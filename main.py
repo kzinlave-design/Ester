@@ -1,6 +1,5 @@
 """
-Telegram-бот комплекса «Эстет» с поддержкой Firebase Realtime Database.
-Стек: aiogram 3.x, httpx (Firebase REST), APScheduler 3.x.
+Telegram-бот комплекса «Эстет» на Flask (для деплоя на Render.com через Webhook).
 """
 from __future__ import annotations
 
@@ -34,9 +33,11 @@ from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
+    Update,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from flask import Flask, request, abort
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,7 +47,7 @@ logging.basicConfig(
 logger = logging.getLogger("estet_bot")
 
 # --------------------------------------------------------------------------- #
-# Конфигурация и константы
+# Конфигурация
 # --------------------------------------------------------------------------- #
 
 DT_FMT = "%Y-%m-%d %H:%M"
@@ -77,6 +78,8 @@ class Config:
     slot_days: int
     address: str
     reminder_hours: int = 2
+    webhook_url: str = ""
+    port: int = 10000
 
 
 def load_config() -> Config:
@@ -85,8 +88,11 @@ def load_config() -> Config:
 
     raw_admins = os.getenv("ADMIN_CHAT_IDS", "").replace(" ", "")
     admin_ids = tuple(int(x) for x in raw_admins.split(",") if x)
-    if not admin_ids:
-        logger.warning("ADMIN_CHAT_IDS не задан: уведомления администраторам отправляться не будут.")
+    
+    # Render автоматически подставляет переменную RENDER_EXTERNAL_URL (например, https://your-app.onrender.com)
+    render_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+    webhook_path = os.getenv("WEBHOOK_PATH", f"/webhook/{token}")
+    webhook_url = f"{render_url}{webhook_path}" if render_url else ""
 
     return Config(
         bot_token=token,
@@ -97,6 +103,8 @@ def load_config() -> Config:
         work_end=int(os.getenv("WORK_END_HOUR", "20")),
         slot_days=int(os.getenv("SLOT_DAYS_AHEAD", "14")),
         address=os.getenv("SHOP_ADDRESS", "уточняйте по телефону"),
+        webhook_url=webhook_url,
+        port=int(os.getenv("PORT", "10000")),
     )
 
 
@@ -111,7 +119,6 @@ def now_local(cfg: Config) -> datetime:
 DEFAULT_MASTERS = ("Артём", "Дамир", "Руслан")
 
 DEFAULT_SERVICES = (
-    # Барбершоп
     ("💈 Барбершоп", "Стрижка", "4 000–5 000", 60),
     ("💈 Барбершоп", "Подростковая стрижка (12–16 лет)", "3 500–4 500", 60),
     ("💈 Барбершоп", "Детская стрижка (до 12 лет)", "3 000–4 000", 60),
@@ -128,19 +135,16 @@ DEFAULT_SERVICES = (
     ("💈 Барбершоп", "Трихоскоп — проверка луковиц волос", "2 000–3 000", 30),
     ("💈 Барбершоп", "HEAD SPA японский массаж головы", "9 900", 60),
     ("💈 Барбершоп", "Полный комплекс услуг (одежда, спа, барбершоп, косметолог, подолог)", "25 000", 120),
-    # Спа программы
     ("🧖 Спа программы", "HEAD SPA японский массаж головы (50 мин)", "9 900", 60),
     ("🧖 Спа программы", "Программы на 1 персону", "18 000–35 000", 120),
     ("🧖 Спа программы", "Программы на 2 персоны", "35 000–45 000", 120),
     ("🧖 Спа программы", "Программы на 3 персоны", "50 000–65 000", 120),
-    # Подология
     ("🦶 Подология", "Сеанс у подолога (медицинский педикюр)", "10 000–13 000", 60),
     ("🦶 Подология", "Классический маникюр", "5 000", 60),
     ("🦶 Подология", "Классический педикюр обработка", "8 000–10 000", 60),
     ("🦶 Подология", "Установка Титановой нити (1 ноготь)", "15 000", 60),
     ("🦶 Подология", "Удаление бородавок (сеанс)", "5 000", 30),
     ("🦶 Подология", "Лечение грибка на ногтях", "5 000–10 000", 60),
-    # Массажный кабинет
     ("💆 Массажный кабинет", "Классический массаж (60 мин)", "14 000", 60),
     ("💆 Массажный кабинет", "Массаж в 4 руки (60 мин)", "25 000", 60),
     ("💆 Массажный кабинет", "Шейно-воротниковый массаж (20 мин)", "5 000", 30),
@@ -152,7 +156,6 @@ DEFAULT_SERVICES = (
     ("💆 Массажный кабинет", "Лимфодренажный массаж (60 мин)", "15 000", 60),
     ("💆 Массажный кабинет", "Пояснично-крестцовый массаж (20 мин)", "5 000", 30),
     ("💆 Массажный кабинет", "Массаж стоп (15 мин)", "3 000", 30),
-    # Косметология
     ("✨ Косметология", "Услуга 3в1 — чистка, пилинг, альгинатная маска", "15 000", 60),
     ("✨ Косметология", "Чистка лица + карбоновый пилинг + альгинатная маска", "30 000", 60),
     ("✨ Косметология", "Чистка лица + пилинг", "25 000", 60),
@@ -163,7 +166,6 @@ DEFAULT_SERVICES = (
 
 
 def _iter_items(data) -> list[tuple[str, dict]]:
-    """Безопасно извлекает пары (ключ, словарь) независимо от того, вернул Firebase dict или list."""
     if not data:
         return []
     if isinstance(data, dict):
@@ -174,9 +176,8 @@ def _iter_items(data) -> list[tuple[str, dict]]:
 
 
 # --------------------------------------------------------------------------- #
-# Работа с Firebase Realtime Database через REST API
+# Firebase DB
 # --------------------------------------------------------------------------- #
-
 
 class FirebaseDatabase:
     def __init__(self, base_url: str) -> None:
@@ -231,7 +232,6 @@ class FirebaseDatabase:
                 await self._put("services", s_data)
 
     async def ensure_slots(self, cfg: Config) -> None:
-        """Создает недостающие слоты одним пакетным PATCH-запросом без спама."""
         today = now_local(cfg).date()
         async with self._lock:
             masters_raw = await self._get("masters")
@@ -491,7 +491,7 @@ class FirebaseDatabase:
 
 
 # --------------------------------------------------------------------------- #
-# Callback-данные и состояния FSM
+# Telegram Роутер и Хендлеры
 # --------------------------------------------------------------------------- #
 
 router = Router()
@@ -544,11 +544,6 @@ class BookingStates(StatesGroup):
     name = State()
     phone = State()
     confirm = State()
-
-
-# --------------------------------------------------------------------------- #
-# Утилиты и клавиатуры
-# --------------------------------------------------------------------------- #
 
 
 def fmt_dt(start_at: str) -> str:
@@ -632,11 +627,6 @@ async def notify_admins(bot: Bot, cfg: Config, text: str) -> None:
             logger.exception("Не удалось отправить уведомление в чат %s", chat_id)
 
 
-# --------------------------------------------------------------------------- #
-# Главное меню
-# --------------------------------------------------------------------------- #
-
-
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
@@ -661,11 +651,6 @@ async def cb_home(cb: CallbackQuery, state: FSMContext) -> None:
 async def cb_contacts(cb: CallbackQuery, cfg: Config) -> None:
     await edit(cb, contacts_text(cfg), back_to_menu_kb(extra_whatsapp=True))
     await cb.answer()
-
-
-# --------------------------------------------------------------------------- #
-# Сценарий записи (FSM)
-# --------------------------------------------------------------------------- #
 
 
 @router.callback_query(MenuCb.filter(F.action == "book"))
@@ -860,14 +845,14 @@ async def msg_phone_text(message: Message, state: FSMContext, db: FirebaseDataba
     await _finish_phone(message, state, db, phone)
 
 
-@router.callback_query(ConfirmCb.filter(F.ok == False), BookingStates.confirm)  # noqa: E712
+@router.callback_query(ConfirmCb.filter(F.ok == False), BookingStates.confirm)
 async def cb_confirm_no(cb: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await edit(cb, "Запись отменена.\n\n" + WELCOME_TEXT, main_menu_kb())
     await cb.answer()
 
 
-@router.callback_query(ConfirmCb.filter(F.ok == True), BookingStates.confirm)  # noqa: E712
+@router.callback_query(ConfirmCb.filter(F.ok == True), BookingStates.confirm)
 async def cb_confirm_yes(cb: CallbackQuery, state: FSMContext, db: FirebaseDatabase, bot: Bot, cfg: Config) -> None:
     data = await state.get_data()
     await state.clear()
@@ -908,11 +893,6 @@ async def cb_confirm_yes(cb: CallbackQuery, state: FSMContext, db: FirebaseDatab
         f"Услуга: {appt['service_name']}\n"
         f"Клиент: {appt['client_name']}, {appt['client_phone']}",
     )
-
-
-# --------------------------------------------------------------------------- #
-# Мои записи
-# --------------------------------------------------------------------------- #
 
 
 async def render_my_appointments(cb: CallbackQuery, db: FirebaseDatabase, cfg: Config) -> None:
@@ -976,11 +956,6 @@ async def cb_my_cancel(cb: CallbackQuery, callback_data: MyCb, db: FirebaseDatab
     await notify_admins(bot, cfg, f"Освободилось окошко на {fmt_dt(row['start_at'])} у мастера {row['master_name']}!")
 
 
-# --------------------------------------------------------------------------- #
-# Реакция на напоминание
-# --------------------------------------------------------------------------- #
-
-
 @router.callback_query(RemCb.filter(F.action == "yes"))
 async def cb_reminder_yes(cb: CallbackQuery, callback_data: RemCb, db: FirebaseDatabase) -> None:
     appt = await db.get_appointment(callback_data.appt_id)
@@ -1020,11 +995,6 @@ async def cb_stale(cb: CallbackQuery) -> None:
 async def on_error(event: ErrorEvent) -> bool:
     logger.error("Необработанная ошибка в хендлере: %s", event.exception, exc_info=event.exception)
     return True
-
-
-# --------------------------------------------------------------------------- #
-# Фоновые задачи
-# --------------------------------------------------------------------------- #
 
 
 async def send_reminders(bot: Bot, db: FirebaseDatabase, cfg: Config) -> None:
@@ -1070,22 +1040,47 @@ async def refresh_slots(db: FirebaseDatabase, cfg: Config) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Точка входа
+# Flask приложение и запуск веб-сервера
 # --------------------------------------------------------------------------- #
 
+app = Flask(__name__)
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
 
-async def main() -> None:
-    cfg = load_config()
+cfg = load_config()
+db = FirebaseDatabase(cfg.firebase_url)
+bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher(storage=MemoryStorage())
+dp.include_router(router)
+dp["db"] = db
+dp["cfg"] = cfg
 
-    db = FirebaseDatabase(cfg.firebase_url)
+
+@app.route("/")
+def index():
+    return "Bot is running via Webhook!", 200
+
+
+@app.route(f"/webhook/{cfg.bot_token}", methods=["POST"])
+def webhook():
+    if request.headers.get("content-type") == "application/json":
+        json_data = request.get_json()
+        update = Update.model_validate(json_data, context={"bot": bot})
+        loop.run_until_complete(dp.feed_update(bot, update))
+        return "", 200
+    else:
+        abort(403)
+
+
+async def startup():
     await db.init_schema()
     await db.ensure_slots(cfg)
-
-    bot = Bot(cfg.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(router)
-    dp["db"] = db
-    dp["cfg"] = cfg
+    
+    if cfg.webhook_url:
+        await bot.set_webhook(cfg.webhook_url, drop_pending_updates=True)
+        logger.info(f"Webhook установлен: {cfg.webhook_url}")
+    else:
+        logger.warning("RENDER_EXTERNAL_URL не найдена, webhook не установлен автоматически!")
 
     scheduler = AsyncIOScheduler(timezone=cfg.tz)
     scheduler.add_job(
@@ -1098,18 +1093,7 @@ async def main() -> None:
     )
     scheduler.start()
 
-    logger.info("Бот запущен с поддержкой Firebase Realtime Database!")
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        await dp.start_polling(bot)
-    finally:
-        scheduler.shutdown(wait=False)
-        await db.close()
-        await bot.session.close()
-
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Бот остановлен")
+    loop.run_until_complete(startup())
+    app.run(host="0.0.0.0", port=cfg.port)
